@@ -1,0 +1,105 @@
+name: Full reference vs extended 8 MiB benchmark
+
+on:
+  push:
+    paths:
+      - "bundle/cmix-full-ref-vs-extended-8m.tar.gz.enc"
+      - ".github/workflows/full-ref-vs-extended-8m.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmix-full-ref-vs-extended-8m
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out encrypted benchmark bundle
+        uses: actions/checkout@v5
+
+      - name: Decrypt and verify private bundle
+        env:
+          CMIX_BUNDLE_KEY: ${{ secrets.CMIX_BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CMIX_BUNDLE_KEY"
+          mkdir -p private
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in bundle/cmix-full-ref-vs-extended-8m.tar.gz.enc \
+            -out /tmp/cmix-full-ref-vs-extended-8m.tar.gz \
+            -pass env:CMIX_BUNDLE_KEY
+          tar -xzf /tmp/cmix-full-ref-vs-extended-8m.tar.gz -C private
+          rm -f /tmp/cmix-full-ref-vs-extended-8m.tar.gz
+          (cd private && sha256sum -c SOURCE_SHA256SUMS >/dev/null)
+          chmod 700 private/run_benchmark.sh
+          echo "Encrypted source bundle verified."
+
+      - name: Build and run full-package comparison
+        id: benchmark
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd private
+          ./run_benchmark.sh
+
+      - name: Show non-sensitive metrics
+        if: always()
+        run: |
+          for file in environment.txt package_meta.txt results.tsv; do
+            if test -f "private/output/$file"; then
+              echo "=== $file ==="
+              cat "private/output/$file"
+            fi
+          done
+      - name: Upload metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmix-full-ref-vs-extended-8m-metrics
+          path: |
+            private/output/environment.txt
+            private/output/package_meta.txt
+            private/output/results.tsv
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Encrypt private diagnostics
+        if: always()
+        env:
+          CMIX_BUNDLE_KEY: ${{ secrets.CMIX_BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          if test -d private/output/logs; then
+            tar -C private -czf /tmp/cmix-full-private-diagnostics.tar.gz output/logs output/environment.txt output/package_meta.txt output/results.tsv 2>/dev/null || true
+            if test -s /tmp/cmix-full-private-diagnostics.tar.gz; then
+              openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+                -in /tmp/cmix-full-private-diagnostics.tar.gz \
+                -out cmix-full-private-diagnostics.tar.gz.enc \
+                -pass env:CMIX_BUNDLE_KEY
+            fi
+          fi
+      - name: Upload encrypted diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmix-full-private-diagnostics-encrypted
+          path: cmix-full-private-diagnostics.tar.gz.enc
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove decrypted material
+        if: always()
+        run: |
+          rm -rf private
+          rm -f /tmp/cmix-full-ref-vs-extended-8m.tar.gz
+          rm -f /tmp/cmix-full-private-diagnostics.tar.gz
+          rm -f cmix-full-private-diagnostics.tar.gz.enc
+
+      - name: Enforce benchmark success
+        if: always()
+        run: test "${{ steps.benchmark.outcome }}" = "success"
