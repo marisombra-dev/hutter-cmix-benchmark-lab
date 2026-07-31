@@ -45,7 +45,7 @@ jobs:
           tar -xzf /tmp/cmix-frontier-2m.tar.gz -C bench
           rm -f /tmp/cmix-frontier-2m.tar.gz
           chmod 700 bench/control_o25 bench/order20 bench/order15
-          (cd bench && sha256sum -c SHA256SUMS)
+          (cd bench && sed -E 's#  .*/#  #' SHA256SUMS | sha256sum -c -)
           ls -lh bench
 
       - name: Run bracketed single-core comparison
