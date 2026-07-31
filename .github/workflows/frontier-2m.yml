@@ -1,0 +1,107 @@
+name: Encrypted cmix frontier 2 MiB benchmark
+
+on:
+  push:
+    paths:
+      - "bundle/cmix-frontier-2m.tar.gz.enc"
+      - ".github/workflows/frontier-2m.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmix-frontier-2m
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out encrypted bundle
+        uses: actions/checkout@v5
+
+      - name: Record runner environment
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu
+          free -h
+          df -hT
+          cat /proc/loadavg
+
+      - name: Decrypt and verify benchmark bundle
+        env:
+          CMIX_BUNDLE_KEY: ${{ secrets.CMIX_BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CMIX_BUNDLE_KEY"
+          mkdir -p bench
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in bundle/cmix-frontier-2m.tar.gz.enc \
+            -out /tmp/cmix-frontier-2m.tar.gz \
+            -pass env:CMIX_BUNDLE_KEY
+          tar -xzf /tmp/cmix-frontier-2m.tar.gz -C bench
+          rm -f /tmp/cmix-frontier-2m.tar.gz
+          chmod 700 bench/control_o25 bench/order20 bench/order15
+          (cd bench && sha256sum -c SHA256SUMS)
+          ls -lh bench
+
+      - name: Run bracketed single-core comparison
+        run: |
+          set -euo pipefail
+          printf 'name\twall_s\tuser_s\tsys_s\tmaxrss_kb\tmajflt\tminflt\tfs_in\tfs_out\tvol_cs\tinvol_cs\toutput_bytes\tsha256\n' > results.tsv
+
+          run_case() {
+            name="$1"
+            binary="$2"
+            work="runs/$name"
+            mkdir -p "$work"
+            cp bench/input.wrt "$work/input.wrt"
+            echo "=== START $name using $binary at $(date -u +%FT%TZ) ==="
+            (
+              cd "$work"
+              /usr/bin/time -f '%e\t%U\t%S\t%M\t%F\t%R\t%I\t%O\t%w\t%c' \
+                -o time.tsv \
+                taskset -c 0 "../../bench/$binary" -n input.wrt output.cmix \
+                > progress.log 2> stderr.log
+              bytes=$(stat -c %s output.cmix)
+              hash=$(sha256sum output.cmix | awk '{print $1}')
+              printf '%s\t' "$name" >> ../../results.tsv
+              cat time.tsv >> ../../results.tsv
+              printf '\t%s\t%s\n' "$bytes" "$hash" >> ../../results.tsv
+              rm -f ppm.temp
+            )
+            echo "=== END $name at $(date -u +%FT%TZ) ==="
+            tail -n 1 results.tsv
+            free -h
+            df -hT .
+          }
+
+          run_case controlA control_o25
+          run_case order20A order20
+          run_case order15A order15
+          run_case order15B order15
+          run_case order20B order20
+          run_case controlB control_o25
+
+          echo '=== FINAL RESULTS ==='
+          cat results.tsv
+
+      - name: Upload metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmix-frontier-2m-metrics
+          path: |
+            results.tsv
+            runs/*/time.tsv
+            runs/*/stderr.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Remove decrypted material
+        if: always()
+        run: |
+          rm -rf bench runs /tmp/cmix-frontier-2m.tar.gz
