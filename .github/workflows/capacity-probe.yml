@@ -1,0 +1,75 @@
+name: Native Linux capacity probe
+
+on:
+  push:
+    paths:
+      - "probe/**"
+      - ".github/workflows/capacity-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capacity:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out probe
+        uses: actions/checkout@v4
+
+      - name: Record runner hardware and storage
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu
+          free -h
+          df -hT
+          df -i
+          cat /proc/meminfo
+          ulimit -a
+
+      - name: Build probe
+        run: |
+          set -euxo pipefail
+          gcc -O2 -Wall -Wextra -o capacity_probe probe/capacity_probe.c
+          sha256sum capacity_probe
+
+      - name: Exercise cmix-sized sparse mapping
+        id: sparse
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          /usr/bin/time -v ./capacity_probe sparse 2>&1 | tee sparse.log
+          status=${PIPESTATUS[0]}
+          echo "probe_exit=$status" >> "$GITHUB_OUTPUT"
+          stat ppm.temp || true
+          du -h ppm.temp || true
+          du -h --apparent-size ppm.temp || true
+          df -hT .
+          filefrag -v ppm.temp | head -80 || true
+          exit "$status"
+
+      - name: Exercise 9 GiB resident-memory load
+        id: rss
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          /usr/bin/time -v ./capacity_probe rss 2>&1 | tee rss.log
+          status=${PIPESTATUS[0]}
+          echo "probe_exit=$status" >> "$GITHUB_OUTPUT"
+          free -h
+          exit "$status"
+
+      - name: Summarize capacity result
+        if: always()
+        run: |
+          echo "sparse_probe_exit=${{ steps.sparse.outputs.probe_exit }}"
+          echo "rss_probe_exit=${{ steps.rss.outputs.probe_exit }}"
+          echo "Final storage state before cleanup:"
+          df -hT
+          rm -f ppm.temp
+          echo "Storage after cleanup:"
+          df -hT
+          test "${{ steps.sparse.outputs.probe_exit }}" = "0"
+          test "${{ steps.rss.outputs.probe_exit }}" = "0"
