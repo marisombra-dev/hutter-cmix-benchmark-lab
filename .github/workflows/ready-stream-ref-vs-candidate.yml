@@ -1,0 +1,110 @@
+name: Authentic ready-stream reference vs candidate benchmark
+
+on:
+  push:
+    paths:
+      - "bundle/cmix-ready-stream-ref-vs-candidate.tar.gz.enc"
+      - ".github/workflows/ready-stream-ref-vs-candidate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmix-ready-stream-ref-vs-candidate
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out encrypted benchmark bundle
+        uses: actions/checkout@v5
+
+      - name: Decrypt and verify private bundle
+        env:
+          CMIX_BUNDLE_KEY: ${{ secrets.CMIX_BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$CMIX_BUNDLE_KEY"
+          mkdir -p private
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in bundle/cmix-ready-stream-ref-vs-candidate.tar.gz.enc \
+            -out /tmp/cmix-ready-stream-ref-vs-candidate.tar.gz \
+            -pass env:CMIX_BUNDLE_KEY
+          tar -xzf /tmp/cmix-ready-stream-ref-vs-candidate.tar.gz -C private
+          rm -f /tmp/cmix-ready-stream-ref-vs-candidate.tar.gz
+          (cd private && sha256sum -c SOURCE_SHA256SUMS >/dev/null)
+          chmod 700 private/run_benchmark.sh
+          echo "Encrypted source bundle verified."
+
+      - name: Build, prepare authentic streams, and benchmark
+        id: benchmark
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd private
+          ./run_benchmark.sh
+
+      - name: Show non-sensitive metrics
+        if: always()
+        run: |
+          for file in environment.txt build_sha256.txt preprocess.tsv sample_sha256.txt core_results.tsv; do
+            if test -f "private/output/$file"; then
+              echo "=== $file ==="
+              cat "private/output/$file"
+            fi
+          done
+      - name: Upload metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmix-ready-stream-ref-vs-candidate-metrics
+          path: |
+            private/output/environment.txt
+            private/output/build_sha256.txt
+            private/output/preprocess.tsv
+            private/output/sample_sha256.txt
+            private/output/core_results.tsv
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Encrypt private diagnostics
+        if: always()
+        env:
+          CMIX_BUNDLE_KEY: ${{ secrets.CMIX_BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          if test -d private/output/logs; then
+            tar -C private -czf /tmp/cmix-ready-private-diagnostics.tar.gz \
+              output/logs output/environment.txt output/build_sha256.txt \
+              output/preprocess.tsv output/sample_sha256.txt output/core_results.tsv \
+              2>/dev/null || true
+            if test -s /tmp/cmix-ready-private-diagnostics.tar.gz; then
+              openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+                -in /tmp/cmix-ready-private-diagnostics.tar.gz \
+                -out cmix-ready-private-diagnostics.tar.gz.enc \
+                -pass env:CMIX_BUNDLE_KEY
+            fi
+          fi
+      - name: Upload encrypted diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmix-ready-private-diagnostics-encrypted
+          path: cmix-ready-private-diagnostics.tar.gz.enc
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove decrypted material
+        if: always()
+        run: |
+          rm -rf private
+          rm -f /tmp/cmix-ready-stream-ref-vs-candidate.tar.gz
+          rm -f /tmp/cmix-ready-private-diagnostics.tar.gz
+          rm -f cmix-ready-private-diagnostics.tar.gz.enc
+
+      - name: Enforce benchmark success
+        if: always()
+        run: test "${{ steps.benchmark.outcome }}" = "success"
